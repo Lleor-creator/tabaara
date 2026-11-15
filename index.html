@@ -1719,10 +1719,26 @@ function field(label, bind, mode, value) {
 }
 function pinField(label, bind) {
   const id = "f-" + bind;
-  return h("div", { class: "field" },
-    h("label", { for: id, text: label }),
-    h("input", { id, "data-bind": bind, value: ui.bind[bind] || "", autocomplete: "off", inputmode: "numeric", maxlength: "4" })
-  );
+  const wrap = h("div", { class: "field" });
+  wrap.append(h("label", { for: id, text: label }));
+  const row = h("div", { class: "split", style: "align-items:center; gap:0.4rem" });
+  const input = h("input", {
+    id, "data-bind": bind, value: ui.bind[bind] || "",
+    autocomplete: "off", inputmode: "numeric", maxlength: "4",
+    type: "password", style: "flex:1"
+  });
+  const eye = h("button", {
+    type: "button", class: "mini", text: "👁",
+    "aria-label": "Show or hide PIN",
+    onclick: (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      input.type = input.type === "password" ? "text" : "password";
+    }
+  });
+  row.append(input, eye);
+  wrap.append(row);
+  return wrap;
 }
 
 function header() {
@@ -2921,7 +2937,7 @@ const actions = {
     if (next === "manager") {
       if (state.pinHash) { ui.gate = "pin"; ui.passMsg = ""; ui.bind.pin = ""; render(); return; }
       state.profile = "manager";
-      startManagerListener();
+      startShiftListener();
       ui.tab = "inbox";
       save();
       render();
@@ -2948,7 +2964,7 @@ const actions = {
     ui.shiftEnded = false;
     ui.badLink = false;
     state.profile = "manager";
-    startManagerListener();
+    startShiftListener();
     ui.tab = "inbox";
     history.replaceState(null, "", location.pathname);
     save();
@@ -3292,7 +3308,7 @@ const actions = {
     if (leavingTill) {
       if (state.pinHash) { ui.gate = "pin"; ui.passMsg = ""; render(); return; }
       state.profile = "manager";
-      startManagerListener();
+      startShiftListener();
       ui.tab = "inbox";
       save();
     }
@@ -3397,6 +3413,22 @@ document.body.addEventListener("input", (e) => {
   const target = e.target;
   if (target.dataset && target.dataset.bind) ui.bind[target.dataset.bind] = target.value;
   if (target.dataset && target.dataset.qty) ui.qty[target.dataset.qty] = target.value;
+  // Auto-unlock Manager PIN when 4 correct digits entered
+  if (ui.gate === "pin" && target.dataset.bind === "pin" && digits(target.value).length === 4) {
+    if (checkPin(target.value)) {
+      ui.gate = "";
+      ui.passMsg = "";
+      ui.cashier = false;
+      ui.shiftEnded = false;
+      ui.badLink = false;
+      state.profile = "manager";
+      if (typeof startShiftListener === "function") startShiftListener();
+      ui.tab = "inbox";
+      history.replaceState(null, "", location.pathname);
+      save();
+      render();
+    }
+  }
 });
 document.body.addEventListener("change", (e) => {
   const target = e.target;
