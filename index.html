@@ -313,6 +313,9 @@ html[data-theme="daylight"] .low { text-decoration: underline; }
 .screen, .gate, .drawer, .sheet, .shell {
   animation: fadeIn 0.28s ease;
 }
+#main {
+  transition: opacity 0.18s ease;
+}
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
@@ -855,7 +858,11 @@ async function loadRemoteShift(token) {
   try {
     const snap = await db.ref("shifts/" + token + "/meta").once("value");
     const meta = snap.val();
-    if (!meta || !meta.end || Date.now() >= meta.end || !meta.keyHash) return false;
+    if (!meta || !meta.keyHash) return false;
+    if (meta.ended === true || (meta.end && Date.now() >= meta.end)) {
+      lockClosedShift(token, meta.ended === true ? "closed" : "expired");
+      return false;
+    }
     if (meta.owner && ownerUid && meta.owner !== ownerUid) return false;
 
     state.shift = {
@@ -890,20 +897,8 @@ async function loadRemoteShift(token) {
 function listenForShiftEnd(token) {
   if (!syncEnabled || !db || !token) return;
   db.ref("shifts/" + token + "/meta/ended").on("value", (snap) => {
-    if (snap.val() === true && (ui.cashier || ui.shiftEnded)) {
-      ui.shiftEnded = true;
-      ui.cashier = false;
-      state.shift = null;
-      state.profile = "solo";
-      ui.managerUnlocked = false;
-      if (state.pinHash) {
-        ui.gate = "pin";
-        ui.passMsg = "";
-        ui.bind.pin = "";
-      } else {
-        ui.gate = "";
-      }
-      save();
+    if (snap.val() === true && (ui.cashier || ui.shiftEnded || state.shiftLock)) {
+      lockClosedShift(token, "closed");
       if (typeof render === "function") render();
     }
   });
@@ -1583,6 +1578,11 @@ function normalize(data) {
     moved = true;
   }
   if (typeof data.soloPinHash !== "string") { data.soloPinHash = ""; moved = true; }
+  if (!data.shiftLock || typeof data.shiftLock !== "object") { data.shiftLock = null; moved = true; }
+  if (typeof data.pinFails !== "number") { data.pinFails = 0; moved = true; }
+  if (typeof data.pinLockUntil !== "number") { data.pinLockUntil = 0; moved = true; }
+  if (typeof data.soloFails !== "number") { data.soloFails = 0; moved = true; }
+  if (typeof data.soloLockUntil !== "number") { data.soloLockUntil = 0; moved = true; }
   if (typeof data.modesIntroSeen !== "boolean") { data.modesIntroSeen = false; moved = true; }
   if (!data.helpSeenTabs || typeof data.helpSeenTabs !== "object") { data.helpSeenTabs = {}; moved = true; }
   if (splitLegacyDebts(data.solo)) moved = true;
@@ -1613,7 +1613,8 @@ function seed() {
     deviceCred: "",
     solo: blankBook("s-", true),
     manager: Object.assign(blankBook("m-", false), { inbox: [] }),
-    shift: null
+    shift: null,
+    shiftLock: null
   });
 }
 
@@ -1675,6 +1676,7 @@ function freshUi() {
     passMsg: "",
     cashier: false,
     shiftEnded: false,
+    shiftLock: false,
     badLink: false,
     pending: null,
     price: {},
@@ -1763,14 +1765,29 @@ function readKey() {
   return match ? decodeURIComponent(match[1]) : "";
 }
 function enterCashier(code) {
-  if (!code || !state.shift || code !== state.shift.token || Date.now() >= state.shift.end) {
-    ui.badLink = true;
+  if (!code) return false;
+  if (state.shiftLock && state.shiftLock.token === code) {
+    ui.shiftLock = true;
+    ui.shiftEnded = true;
     ui.cashier = false;
+    ui.gate = "shift";
+    ui.badLink = false;
+    return false;
+  }
+  if (!state.shift || code !== state.shift.token || Date.now() >= state.shift.end) {
+    if (state.shift && code === state.shift.token && Date.now() >= state.shift.end) {
+      lockClosedShift(code, "expired");
+    } else {
+      ui.badLink = true;
+      ui.cashier = false;
+    }
     return false;
   }
   ui.cashier = true;
   ui.badLink = false;
   ui.shiftEnded = false;
+  ui.shiftLock = false;
+  ui.gate = "";
   ui.settings = false;
   ui.notice = "";
   ui.sheet = "";
@@ -1806,10 +1823,30 @@ function toast(msg, bad) {
 function cashierLabel() {
   return (state.shift && state.shift.cashierName) || "Cashier";
 }
+function lockClosedShift(token, reason) {
+  const at = Date.now();
+  state.shiftLock = { token: token || "", reason: reason || "closed", endedAt: at };
+  state.shift = null;
+  ui.shiftLock = true;
+  ui.shiftEnded = true;
+  ui.cashier = false;
+  ui.gate = "shift";
+  ui.badLink = false;
+  ui.managerUnlocked = false;
+  ui.settings = false;
+  ui.drawer = false;
+  ui.sheet = "";
+  ui.bind.pin = "";
+  ui.passMsg = "";
+  ui.freshCode = "";
+  save();
+}
+
 function endShift() {
   if (!state.shift) return;
   const token = state.shift.token;
   const hours = state.shift.hours;
+  const wasCashier = !!ui.cashier;
   if (token && syncEnabled && db) {
     db.ref("shifts/" + token + "/meta/ended").set(true).catch(() => {});
     db.ref("shifts/" + token + "/meta/endedAt").set(Date.now()).catch(() => {});
@@ -1820,7 +1857,11 @@ function endShift() {
     id: uid(), at: Date.now(), kind: "shift", title: "Shift closed",
     detail: hours + " hour shift archived into the books", amount: 0
   });
-  save();
+  if (wasCashier) {
+    lockClosedShift(token, "closed");
+  } else {
+    save();
+  }
 }
 
 function note(msg, bad) {
@@ -1833,31 +1874,38 @@ function field(label, bind, mode, value) {
     h("input", { id, "data-bind": bind, value: value == null ? "" : String(value), autocomplete: "off", inputmode: mode || "text" })
   );
 }
-function pinField(label, bind) {
+function secretField(label, bind, opts) {
+  opts = opts || {};
   const id = "f-" + bind;
   if (!ui.pinShow) ui.pinShow = {};
   const shown = !!ui.pinShow[bind];
+  const numeric = !!opts.numeric;
+  const maxlength = opts.maxlength || (numeric ? "4" : null);
   const wrap = h("div", { class: "field" });
   wrap.append(h("label", { for: id, text: label }));
   const row = h("div", { class: "split", style: "align-items:center; gap:0.4rem" });
-  const input = h("input", {
+  const inputProps = {
     id, "data-bind": bind, value: ui.bind[bind] || "",
-    autocomplete: "off", inputmode: "numeric", maxlength: "4",
-    type: shown ? "text" : "password", style: "flex:1"
-  });
+    autocomplete: opts.autocomplete || "off", type: shown ? "text" : "password", style: "flex:1"
+  };
+  if (numeric) { inputProps.inputmode = "numeric"; inputProps.pattern = "[0-9]*"; }
+  if (maxlength) inputProps.maxlength = String(maxlength);
+  const input = h("input", inputProps);
   const eye = h("button", {
-    type: "button", class: "mini", text: shown ? "🙈" : "👁",
-    "aria-label": "Show or hide PIN",
-    onclick: (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      ui.pinShow[bind] = !ui.pinShow[bind];
-      render();
-    }
+    type: "button", class: "mini", "data-act": "toggle-secret", "data-secret": bind,
+    text: shown ? "🙈" : "👁",
+    "aria-label": shown ? "Hide password or PIN" : "Show password or PIN",
+    "aria-pressed": shown ? "true" : "false"
   });
   row.append(input, eye);
   wrap.append(row);
   return wrap;
+}
+function pinField(label, bind) {
+  return secretField(label, bind, { numeric: true, maxlength: 4, autocomplete: "off" });
+}
+function passwordField(label, bind) {
+  return secretField(label, bind, { numeric: false, autocomplete: "current-password" });
 }
 
 function header() {
@@ -2378,7 +2426,7 @@ function settingsView() {
     wrap.append(h("button", { type: "button", class: "quiet", "data-act": "owner-signout", text: "Sign out" }));
   } else {
     wrap.append(field("Email", "ownerEmail", "email", ui.bind.ownerEmail || ""));
-    wrap.append(field("Password", "ownerPass", "text", ""));
+    wrap.append(passwordField("Password", "ownerPass"));
     wrap.append(h("div", { class: "grid2" },
       h("button", { type: "button", class: "btn", "data-act": "owner-signin", text: "Sign in" }),
       h("button", { type: "button", class: "quiet", "data-act": "owner-signup", text: "Create account" })
@@ -2654,9 +2702,13 @@ function soloGate() {
   return gateFrame(t("soloGateTitle"), t("soloGateCopy"), kids);
 }
 function endedView() {
-  return gateFrame("Shift closed", "This till is locked. Sales, petty cash, and debts from the shift are already in the manager books.", h("div", { class: "stack" },
-    h("button", { type: "button", class: "btn", "data-act": "leave-cashier", text: "Owner screen" })
-  ));
+  const kids = h("div", { class: "stack" },
+    h("p", { class: "badnote", text: "This device is locked. Enter the correct Manager PIN to return to the owner screen." }),
+    pinField("Manager PIN", "pin"),
+    ui.passMsg ? h("p", { class: "badnote", text: ui.passMsg }) : null,
+    h("button", { type: "button", class: "btn", "data-act": "do-shift-pin", text: "Unlock owner screen" })
+  );
+  return gateFrame("Shift closed", "This till is locked. Sales, petty cash, and debts from the shift are already in the manager books.", kids);
 }
 function badLinkView() {
   return gateFrame("Link not active", "Could not open this cashier shift. Check the link or ask the owner to create a new one.", h("div", { class: "stack" },
@@ -2777,15 +2829,40 @@ function sheetBody() {
 
 function render() {
   applyTheme();
-  if (!ui.cashier && !ui.gate && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
+  const now = Date.now();
+  if (now < (state.pinLockUntil || 0)) {
+    const mins = Math.ceil((state.pinLockUntil - now) / 60000);
+    ui.passMsg = "Too many tries. Try again in " + mins + " minute" + (mins === 1 ? "" : "s") + ".";
+  } else if (state.pinLockUntil && now >= state.pinLockUntil && ui.passMsg.indexOf("Too many tries") === 0) {
+    state.pinLockUntil = 0;
+    state.pinFails = 0;
+    save();
+    ui.passMsg = "";
+  }
+  if (ui.gate === "solo" && now < (state.soloLockUntil || 0)) {
+    const mins = Math.ceil((state.soloLockUntil - now) / 60000);
+    ui.passMsg = "Too many tries. Try again in " + mins + " minute" + (mins === 1 ? "" : "s") + ".";
+  } else if (ui.gate === "solo" && state.soloLockUntil && now >= state.soloLockUntil && ui.passMsg.indexOf("Too many tries") === 0) {
+    state.soloLockUntil = 0;
+    state.soloFails = 0;
+    save();
+    ui.passMsg = "";
+  }
+  if (state.shiftLock) {
+    ui.shiftLock = true;
+    ui.shiftEnded = true;
+    ui.cashier = false;
+    ui.gate = "shift";
+    ui.managerUnlocked = false;
+    ui.badLink = false;
+  } else if (!ui.cashier && !ui.gate && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
     ui.gate = "pin";
     ui.passMsg = ui.passMsg || "";
   }
   if (ui.cashier && state.shift && Date.now() >= state.shift.end) {
     endShift();
-    ui.shiftEnded = true;
   } else if (ui.cashier && !state.shift && !ui.badLink) {
-    ui.shiftEnded = true;
+    lockClosedShift((readKey() || ""), "closed");
   }
   const main = document.getElementById("main");
   if (!main) return;
@@ -2793,8 +2870,8 @@ function render() {
   document.body.classList.toggle("noscroll", !!(ui.drawer || ui.sheet || ui.gate));
   document.documentElement.dataset.cashier = ui.cashier ? "1" : "0";
   let view;
-  if (ui.badLink) view = badLinkView();
-  else if (ui.shiftEnded && ui.cashier) view = endedView();
+  if (ui.shiftLock || ui.gate === "shift") view = endedView();
+  else if (ui.badLink) view = badLinkView();
   else if (ui.cashier) view = cashierShell();
   else if (ui.gate === "pin") view = pinGate();
   else if (ui.gate === "solo") view = soloGate();
@@ -3034,41 +3111,73 @@ function saveLedgerDebt(kind) {
 }
 
 function checkPin(pin) {
-  if (Date.now() < (state.pinLockUntil || 0)) {
-    const mins = Math.ceil((state.pinLockUntil - Date.now()) / 60000);
+  const now = Date.now();
+  if (now < (state.pinLockUntil || 0)) {
+    const mins = Math.ceil((state.pinLockUntil - now) / 60000);
     ui.passMsg = "Too many tries. Try again in " + mins + " minute" + (mins === 1 ? "" : "s") + ".";
     return false;
   }
-  if (digits(pin).length !== 4 || sha256(digits(pin)) !== state.pinHash) {
-    state.pinFails = (state.pinFails || 0) + 1;
-    const left = 5 - state.pinFails;
-    if (state.pinFails >= 5) {
-      state.pinLockUntil = Date.now() + 10 * 60 * 1000;
+  if ((state.pinLockUntil || 0) && now >= state.pinLockUntil) {
+    state.pinLockUntil = 0;
+    state.pinFails = 0;
+  }
+
+  const entered = digits(pin);
+  const correct = entered.length === 4 && sha256(entered) === state.pinHash;
+  if (!correct) {
+    state.pinFails = Math.min(5, (state.pinFails || 0) + 1);
+    const remaining = 5 - state.pinFails;
+
+    if (remaining === 0) {
+      state.pinLockUntil = now + 60 * 1000;
       state.pinFails = 0;
-      ui.passMsg = "Too many tries. Locked for 10 minutes.";
+      ui.passMsg = "Too many tries. Locked for 1 minute.";
     } else {
-      ui.passMsg = "Wrong PIN. " + left + " attempt" + (left === 1 ? "" : "s") + " left.";
+      ui.passMsg = "Wrong PIN. " + remaining + " attempt" + (remaining === 1 ? "" : "s") + " left.";
     }
     save();
     return false;
   }
+
   state.pinFails = 0;
+  state.pinLockUntil = 0;
   ui.passMsg = "";
   save();
   return true;
 }
+
 function checkSoloPin(pin) {
-  if (Date.now() < (state.soloLockUntil || 0)) return false;
-  if (digits(pin).length !== 4 || sha256(digits(pin)) !== state.soloPinHash) {
-    state.soloFails = (state.soloFails || 0) + 1;
-    if (state.soloFails >= 5) {
-      state.soloLockUntil = Date.now() + 30000;
+  const now = Date.now();
+  if (now < (state.soloLockUntil || 0)) {
+    const mins = Math.ceil((state.soloLockUntil - now) / 60000);
+    ui.passMsg = "Too many tries. Try again in " + mins + " minute" + (mins === 1 ? "" : "s") + ".";
+    return false;
+  }
+  if ((state.soloLockUntil || 0) && now >= state.soloLockUntil) {
+    state.soloLockUntil = 0;
+    state.soloFails = 0;
+  }
+
+  const entered = digits(pin);
+  const correct = entered.length === 4 && sha256(entered) === state.soloPinHash;
+  if (!correct) {
+    state.soloFails = Math.min(5, (state.soloFails || 0) + 1);
+    const remaining = 5 - state.soloFails;
+
+    if (remaining === 0) {
+      state.soloLockUntil = now + 60 * 1000;
       state.soloFails = 0;
+      ui.passMsg = "Too many tries. Locked for 1 minute.";
+    } else {
+      ui.passMsg = "Wrong PIN. " + remaining + " attempt" + (remaining === 1 ? "" : "s") + " left.";
     }
     save();
     return false;
   }
+
   state.soloFails = 0;
+  state.soloLockUntil = 0;
+  ui.passMsg = "";
   save();
   return true;
 }
@@ -3122,11 +3231,41 @@ const actions = {
     if (soloLocked()) { ui.gate = "solo"; ui.passMsg = ""; ui.bind.soloPin = ""; }
     render();
   },
+  "toggle-secret"(el) {
+    const key = el.dataset.secret;
+    if (!key) return;
+    if (!ui.pinShow) ui.pinShow = {};
+    ui.pinShow[key] = !ui.pinShow[key];
+    render();
+    const input = document.getElementById("f-" + key);
+    if (input) { input.focus(); try { input.setSelectionRange(input.value.length, input.value.length); } catch (err) {} }
+  },
+  "do-shift-pin"() {
+    if (!state.shiftLock) return;
+    if (!checkPin(ui.bind.pin || "")) { render(); return; }
+    state.shiftLock = null;
+    ui.shiftLock = false;
+    ui.shiftEnded = false;
+    ui.cashier = false;
+    ui.badLink = false;
+    ui.gate = "";
+    ui.managerUnlocked = true;
+    ui.passMsg = "";
+    ui.bind.pin = "";
+    state.profile = "manager";
+    ui.tab = "inbox";
+    history.replaceState(null, "", location.pathname);
+    startShiftListener();
+    save();
+    render();
+  },
   "do-pin"() {
     if (!checkPin(ui.bind.pin || "")) { render(); return; }
     ui.gate = "";
     ui.passMsg = "";
     ui.managerUnlocked = true;
+    state.shiftLock = null;
+    ui.shiftLock = false;
     ui.cashier = false;
     ui.shiftEnded = false;
     ui.badLink = false;
@@ -3138,7 +3277,7 @@ const actions = {
     render();
   },
   "do-solo-pin"() {
-    if (!checkSoloPin(ui.bind.soloPin || "")) { ui.passMsg = "Wrong Solo PIN"; render(); return; }
+    if (!checkSoloPin(ui.bind.soloPin || "")) { render(); return; }
     ui.gate = "";
     ui.passMsg = "";
     ui.bind.soloPin = "";
@@ -3458,10 +3597,20 @@ const actions = {
     const code = (link.match(/[#&]k=([^&]+)/) || [])[1] || "";
     const decoded = decodeURIComponent(code);
     if (location.hash !== "#k=" + encodeURIComponent(decoded)) location.hash = "k=" + encodeURIComponent(decoded);
-    if (!enterCashier(decoded)) loadRemoteShift(decoded).then(ok => { if (!ok) { ui.badLink = true; ui.cashier = false; } render(); });
+    if (!enterCashier(decoded)) loadRemoteShift(decoded).then(ok => { if (!ok && !state.shiftLock) { ui.badLink = true; ui.cashier = false; } render(); });
     render();
   },
   "leave-cashier"() {
+    if (state.shiftLock || ui.shiftLock) {
+      ui.gate = "shift";
+      ui.shiftLock = true;
+      ui.shiftEnded = true;
+      ui.cashier = false;
+      ui.passMsg = "";
+      ui.bind.pin = "";
+      render();
+      return;
+    }
     history.replaceState(null, "", location.pathname);
     const leavingTill = ui.cashier || ui.shiftEnded;
     ui.badLink = false;
@@ -3575,15 +3724,20 @@ document.body.addEventListener("input", (e) => {
   const target = e.target;
   if (target.dataset && target.dataset.bind) ui.bind[target.dataset.bind] = target.value;
   if (target.dataset && target.dataset.qty) ui.qty[target.dataset.qty] = target.value;
-  // Auto-unlock Manager PIN when 4 correct digits entered
-  if (ui.gate === "pin" && target.dataset.bind === "pin" && digits(target.value).length === 4) {
-    if (checkPin(target.value)) {
+  // Auto-unlock Manager PIN when 4 correct digits are entered.
+  if ((ui.gate === "pin" || ui.gate === "shift") && target.dataset.bind === "pin" && digits(target.value).length === 4) {
+    if (ui.gate === "shift") {
+      actions["do-shift-pin"]();
+    } else if (checkPin(target.value)) {
       ui.gate = "";
       ui.passMsg = "";
       ui.cashier = false;
       ui.shiftEnded = false;
       ui.badLink = false;
+      state.shiftLock = null;
+      ui.shiftLock = false;
       state.profile = "manager";
+      ui.managerUnlocked = true;
       if (typeof startShiftListener === "function") startShiftListener();
       ui.tab = "inbox";
       history.replaceState(null, "", location.pathname);
@@ -3610,7 +3764,11 @@ function tick() {
   });
   if (ui.cashier && state.shift && Date.now() >= state.shift.end) {
     endShift();
-    ui.shiftEnded = true;
+    render();
+    return;
+  }
+  if (!state.shiftLock && readKey() && state.shift && readKey() === state.shift.token && Date.now() >= state.shift.end) {
+    lockClosedShift(state.shift.token, "expired");
     render();
     return;
   }
@@ -3637,7 +3795,7 @@ function bindChannel() {
     const key = readKey();
     if (!key) return;
     if (!enterCashier(key)) loadRemoteShift(key).then(ok => {
-      if (!ok) { ui.badLink = true; ui.cashier = false; }
+      if (!ok && !state.shiftLock) { ui.badLink = true; ui.cashier = false; }
       render();
     });
     render();
@@ -3666,16 +3824,26 @@ function boot() {
   applyTheme();
   bindChannel();
   const key = readKey();
-  if (key) {
+  if (state.shiftLock && (!key || state.shiftLock.token === key)) {
+    ui.shiftLock = true;
+    ui.shiftEnded = true;
+    ui.cashier = false;
+    ui.gate = "shift";
+    ui.managerUnlocked = false;
+    ui.badLink = false;
+    ui.bind.pin = "";
+  } else if (key) {
     ui.cashier = true;
     ui.tab = "sell";
     ui.settings = false;
     ui.badLink = false;
     if (state.shift && key === state.shift.token && Date.now() < state.shift.end) {
       // local shift already valid
+    } else if (state.shift && key === state.shift.token && Date.now() >= state.shift.end) {
+      lockClosedShift(key, "expired");
     } else {
       loadRemoteShift(key).then(ok => {
-        if (!ok) {
+        if (!ok && !state.shiftLock) {
           ui.badLink = true;
           ui.cashier = false;
         }
@@ -3699,7 +3867,7 @@ function boot() {
       enter();
     }, reduceMotion() ? 600 : 2000);
   }
-  setInterval(tick, 5000);
+  setInterval(tick, 1000);
   document.addEventListener("visibilitychange", applyPrivacyCurtain);
   window.addEventListener("blur", applyPrivacyCurtain);
   window.addEventListener("focus", applyPrivacyCurtain);
