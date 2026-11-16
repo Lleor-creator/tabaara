@@ -308,6 +308,33 @@ html[data-theme="daylight"] .low { text-decoration: underline; }
 .help-progress{display:flex;gap:.3rem;margin:.15rem 0 .8rem}.help-dot{height:.3rem;flex:1;border-radius:99px;background:var(--line)}.help-dot.on{background:var(--brand)}
 .help-choice{width:100%;text-align:left;border:1px solid var(--line);background:var(--card);border-radius:.9rem;padding:.8rem;margin-top:.5rem;font-weight:700}.help-choice.on{border:2px solid var(--brand);background:var(--soft)}
 .help-emoji{font-size:1.65rem;margin-bottom:.35rem}.help-actions{display:flex;gap:.5rem;margin-top:1rem}.help-actions>*{flex:1}.help-skip{background:none;border:0;color:var(--muted);font-weight:700;padding:.6rem}
+
+/* Smooth transitions */
+.screen, .gate, .drawer, .sheet, .shell {
+  animation: fadeIn 0.28s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.nav button, .chips button, .btn, .quiet, .choice, .theme-opt {
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease, transform 0.12s ease;
+}
+/* Cashier anti-capture */
+html[data-cashier="1"] body,
+html[data-cashier="1"] .screen,
+html[data-cashier="1"] input {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.privacy-curtain {
+  position: fixed; inset: 0; z-index: 80;
+  background: var(--bg); color: var(--ink);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; letter-spacing: 0.04em;
+  pointer-events: none;
+}
 </style>
 </head>
 <body>
@@ -1776,21 +1803,24 @@ function field(label, bind, mode, value) {
 }
 function pinField(label, bind) {
   const id = "f-" + bind;
+  if (!ui.pinShow) ui.pinShow = {};
+  const shown = !!ui.pinShow[bind];
   const wrap = h("div", { class: "field" });
   wrap.append(h("label", { for: id, text: label }));
   const row = h("div", { class: "split", style: "align-items:center; gap:0.4rem" });
   const input = h("input", {
     id, "data-bind": bind, value: ui.bind[bind] || "",
     autocomplete: "off", inputmode: "numeric", maxlength: "4",
-    type: "password", style: "flex:1"
+    type: shown ? "text" : "password", style: "flex:1"
   });
   const eye = h("button", {
-    type: "button", class: "mini", text: "👁",
+    type: "button", class: "mini", text: shown ? "🙈" : "👁",
     "aria-label": "Show or hide PIN",
     onclick: (e) => {
       e.preventDefault();
       e.stopPropagation();
-      input.type = input.type === "password" ? "text" : "password";
+      ui.pinShow[bind] = !ui.pinShow[bind];
+      render();
     }
   });
   row.append(input, eye);
@@ -2369,7 +2399,7 @@ function settingsView() {
   if (book.products.some((p) => p.sample) || book.sales.some((s) => s.sample)) {
     wrap.append(h("button", { type: "button", class: "quiet", "data-act": "clear-sample", text: t("removeSamples") }));
   }
-  wrap.append(h("p", { class: "fine", text: t("thisPhone") + " · " + (state.deviceId || "") }));
+  wrap.append(h("p", { class: "fine", text: t("thisPhone") }));
   wrap.append(h("p", { class: "fine", text: t("phoneHint") }));
   wrap.append(h("p", { class: "fine", text: t("ura") }));
   
@@ -2724,7 +2754,8 @@ function render() {
   const main = document.getElementById("main");
   if (!main) return;
   main.replaceChildren();
-  document.body.classList.toggle("noscroll", !!(ui.drawer || ui.sheet));
+  document.body.classList.toggle("noscroll", !!(ui.drawer || ui.sheet || ui.gate));
+  document.documentElement.dataset.cashier = ui.cashier ? "1" : "0";
   let view;
   if (ui.badLink) view = badLinkView();
   else if (ui.shiftEnded && ui.cashier) view = endedView();
@@ -2733,6 +2764,24 @@ function render() {
   else if (ui.gate === "solo") view = soloGate();
   else view = shell();
   main.append(view);
+  applyPrivacyCurtain();
+}
+function applyPrivacyCurtain() {
+  let curtain = document.getElementById("privacy-curtain");
+  if (!ui.cashier) {
+    if (curtain) curtain.remove();
+    return;
+  }
+  if (!curtain) {
+    curtain = document.createElement("div");
+    curtain.id = "privacy-curtain";
+    curtain.className = "privacy-curtain";
+    curtain.textContent = "Tabaara";
+    curtain.hidden = true;
+    document.body.appendChild(curtain);
+  }
+  const hide = document.hidden || !document.hasFocus();
+  curtain.hidden = !hide;
 }
 
 function reportText() {
@@ -2949,17 +2998,26 @@ function saveLedgerDebt(kind) {
 }
 
 function checkPin(pin) {
-  if (Date.now() < (state.pinLockUntil || 0)) return false;
+  if (Date.now() < (state.pinLockUntil || 0)) {
+    const mins = Math.ceil((state.pinLockUntil - Date.now()) / 60000);
+    ui.passMsg = "Too many tries. Try again in " + mins + " minute" + (mins === 1 ? "" : "s") + ".";
+    return false;
+  }
   if (digits(pin).length !== 4 || sha256(digits(pin)) !== state.pinHash) {
     state.pinFails = (state.pinFails || 0) + 1;
+    const left = 5 - state.pinFails;
     if (state.pinFails >= 5) {
-      state.pinLockUntil = Date.now() + 30000;
+      state.pinLockUntil = Date.now() + 10 * 60 * 1000;
       state.pinFails = 0;
+      ui.passMsg = "Too many tries. Locked for 10 minutes.";
+    } else {
+      ui.passMsg = "Wrong PIN. " + left + " attempt" + (left === 1 ? "" : "s") + " left.";
     }
     save();
     return false;
   }
   state.pinFails = 0;
+  ui.passMsg = "";
   save();
   return true;
 }
@@ -3029,7 +3087,7 @@ const actions = {
     render();
   },
   "do-pin"() {
-    if (!checkPin(ui.bind.pin || "")) { ui.passMsg = "Wrong PIN"; render(); return; }
+    if (!checkPin(ui.bind.pin || "")) { render(); return; }
     ui.gate = "";
     ui.passMsg = "";
     ui.cashier = false;
@@ -3601,6 +3659,9 @@ function boot() {
     }, reduceMotion() ? 600 : 2000);
   }
   setInterval(tick, 5000);
+  document.addEventListener("visibilitychange", applyPrivacyCurtain);
+  window.addEventListener("blur", applyPrivacyCurtain);
+  window.addEventListener("focus", applyPrivacyCurtain);
 }
 boot();
 </script>
