@@ -875,11 +875,21 @@ async function loadRemoteShift(token) {
       cashierName: meta.cashierName || "Cashier"
     };
 
-    if (meta.book) {
-      const incoming = meta.book;
-      state.manager = normalize(Object.assign(blankBook("m-", false), incoming, { inbox: [] }));
-      if (!Array.isArray(state.manager.inbox)) state.manager.inbox = [];
+    const sameCashierSession = !!(state.cashierSession && state.cashierSession.token === token);
+    if (!sameCashierSession) {
+      const cashierBook = blankBook("c-", false);
+      cashierBook.shopName = meta.shopName || "My Shop";
+      cashierBook.products = Array.isArray(meta.products) ? JSON.parse(JSON.stringify(meta.products)) : [];
+      cashierBook.sales = [];
+      cashierBook.expenses = [];
+      cashierBook.receivables = [];
+      cashierBook.payables = [];
+      cashierBook.inbox = [];
+      state.manager = cashierBook;
+    } else if (Array.isArray(meta.products) && Array.isArray(state.manager.products) && !state.manager.products.length) {
+      state.manager.products = JSON.parse(JSON.stringify(meta.products));
     }
+    state.cashierSession = { token, startedAt: state.cashierSession && state.cashierSession.startedAt || Date.now() };
     state.shiftLock = null;
     ui.shiftLock = false;
     if (ui.gate === "shift") ui.gate = "";
@@ -922,6 +932,9 @@ function registerShiftToken(token, hours, cashierName) {
   if (!syncEnabled || !db || !ownerUid) return;
   const start = Date.now();
   const end = start + hours * 3600000;
+  // Never send the manager's books to a cashier device. The till receives
+  // only the product catalogue and the minimum shift metadata it needs.
+  const products = JSON.parse(JSON.stringify((state.manager && state.manager.products) || []));
   const shiftMeta = {
     id: state.shift && state.shift.id,
     owner: ownerUid,
@@ -930,7 +943,8 @@ function registerShiftToken(token, hours, cashierName) {
     hours,
     start,
     end,
-    book: JSON.parse(JSON.stringify(state.manager || blankBook("m-", false)))
+    shopName: (state.manager && state.manager.shopName) || "My Shop",
+    products
   };
   db.ref("owners/" + ownerUid + "/shifts/" + token).set({
     cashierName: cashierName || "Cashier",
@@ -940,7 +954,7 @@ function registerShiftToken(token, hours, cashierName) {
   db.ref("shifts/" + token + "/meta").set(shiftMeta).catch(() => {});
 }
 
-const VERSION = "1.0.0-alpha";
+const VERSION = "1.0.0-alpha.2";
 const VERSION_NAME = "Tabaara First Light";
 const KEY = "tabaara-v1";
 const LEGACY_KEY = "duka-book-v3";
@@ -1586,6 +1600,8 @@ function normalize(data) {
   }
   if (typeof data.soloPinHash !== "string") { data.soloPinHash = ""; moved = true; }
   if (!data.shiftLock || typeof data.shiftLock !== "object") { data.shiftLock = null; moved = true; }
+  if (!data.cashierSession || typeof data.cashierSession !== "object") { data.cashierSession = null; moved = true; }
+  if (typeof data.lastBackupAt !== "number") { data.lastBackupAt = 0; moved = true; }
   if (typeof data.pinFails !== "number") { data.pinFails = 0; moved = true; }
   if (typeof data.pinLockUntil !== "number") { data.pinLockUntil = 0; moved = true; }
   if (typeof data.soloFails !== "number") { data.soloFails = 0; moved = true; }
@@ -1621,7 +1637,9 @@ function seed() {
     solo: blankBook("s-", true),
     manager: Object.assign(blankBook("m-", false), { inbox: [] }),
     shift: null,
-    shiftLock: null
+    shiftLock: null,
+    cashierSession: null,
+    lastBackupAt: 0
   });
 }
 
@@ -1686,6 +1704,7 @@ function freshUi() {
     shiftLock: false,
     badLink: false,
     shiftLoading: false,
+    cashierExit: false,
     pending: null,
     price: {},
     helpOpen: false,
@@ -1795,6 +1814,7 @@ function enterCashier(code) {
     return false;
   }
   ui.cashier = true;
+  state.cashierSession = { token: code, startedAt: Date.now() };
   ui.badLink = false;
   ui.shiftEnded = false;
   ui.shiftLock = false;
@@ -1859,6 +1879,7 @@ function lockClosedShift(token, reason) {
   const at = Date.now();
   state.shiftLock = { token: token || "", reason: reason || "closed", endedAt: at };
   state.shift = null;
+  state.cashierSession = null;
   ui.shiftLock = true;
   ui.shiftEnded = true;
   ui.cashier = false;
@@ -2526,6 +2547,8 @@ function settingsView() {
     text: "WhatsApp support / feedback" 
   }));
   wrap.append(h("h2", { class: "section", text: "Backup" }));
+  const backupAge = state.lastBackupAt ? Math.floor((Date.now() - state.lastBackupAt) / 86400000) : null;
+  wrap.append(h("p", { class: "hint" + ((backupAge == null || backupAge >= 7) ? " bad" : ""), text: backupAge == null ? "No backup recorded on this phone yet. Export a backup at least weekly." : backupAge >= 7 ? "Your last backup was " + backupAge + " days ago. Export a fresh backup before continuing." : "Last backup: " + backupAge + " day" + (backupAge === 1 ? "" : "s") + " ago." }));
   wrap.append(h("div", { class: "grid2" },
     h("button", { type: "button", class: "quiet", "data-act": "export-backup", text: t("exportBackup") }),
     h("button", { type: "button", class: "quiet", "data-act": "import-backup", text: t("importBackup") })
@@ -2890,6 +2913,15 @@ function render() {
     ui.gate = "shift";
     ui.managerUnlocked = false;
     ui.badLink = false;
+  } else if (!ui.cashier && !ui.gate && !ui.cashierExit && state.cashierSession && state.shift && state.cashierSession.token === state.shift.token && Date.now() < state.shift.end) {
+    ui.cashier = true;
+    ui.gate = "";
+    ui.shiftLoading = false;
+    ui.badLink = false;
+    ui.settings = false;
+    ui.drawer = false;
+    ui.sheet = "";
+    ui.tab = "sell";
   } else if (!ui.cashier && !ui.gate && !ui.shiftLoading && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
     ui.gate = "pin";
     ui.passMsg = ui.passMsg || "";
@@ -3240,8 +3272,9 @@ const actions = {
   close() { ui.drawer = false; ui.sheet = ""; render(); },
   stop() {},
   back() { ui.settings = false; render(); },
-  "open-settings"() { ui.drawer = false; ui.settings = true; ui.sheet = ""; render(); },
+  "open-settings"() { if (ui.cashier || state.cashierSession) return; ui.drawer = false; ui.settings = true; ui.sheet = ""; render(); },
   profile(el) {
+    if (ui.cashier || state.cashierSession) return;
     const next = el.dataset.profile;
     ui.drawer = false;
     ui.notice = "";
@@ -3280,6 +3313,7 @@ const actions = {
     if (!state.shiftLock) return;
     if (!checkPin(ui.bind.pin || "")) { render(); return; }
     state.shiftLock = null;
+    state.cashierSession = null;
     ui.shiftLock = false;
     ui.shiftEnded = false;
     ui.cashier = false;
@@ -3297,10 +3331,13 @@ const actions = {
   },
   "do-pin"() {
     if (!checkPin(ui.bind.pin || "")) { render(); return; }
+    const takingBackCashierPhone = !!ui.cashierExit;
+    ui.cashierExit = false;
     ui.gate = "";
     ui.passMsg = "";
     ui.managerUnlocked = true;
     state.shiftLock = null;
+    state.cashierSession = null;
     ui.shiftLock = false;
     ui.cashier = false;
     ui.shiftEnded = false;
@@ -3599,6 +3636,7 @@ const actions = {
   "owner-signout"() { if (typeof ownerSignOut === "function") ownerSignOut(); },
   "gen-shift"() {
     if (state.profile !== "manager" || ui.cashier) return;
+    if (!state.pinHash) { toast("Set a Manager PIN before creating a cashier shift.", true); return; }
     const hours = Math.min(24, Math.max(1, Number(ui.bind.hours || ui.hours) || 8));
     const cashierName = String(ui.bind.cashierName || "").trim() || "Cashier";
     if (state.shift) {
@@ -3637,6 +3675,16 @@ const actions = {
     render();
   },
   "leave-cashier"() {
+    if (ui.cashier || state.cashierSession) {
+      if (!state.pinHash) { render(); return; }
+      ui.cashierExit = true;
+      ui.cashier = false;
+      ui.gate = "pin";
+      ui.passMsg = "";
+      ui.bind.pin = "";
+      render();
+      return;
+    }
     if (state.shiftLock || ui.shiftLock) {
       ui.gate = "shift";
       ui.shiftLock = true;
@@ -3669,6 +3717,8 @@ const actions = {
     link.href = URL.createObjectURL(blob);
     link.download = "tabaara-backup-" + iso() + ".json";
     link.click();
+    state.lastBackupAt = Date.now();
+    save();
     setTimeout(() => URL.revokeObjectURL(link.href), 1500);
     toast(t("backupExported"));
   },
@@ -3829,6 +3879,13 @@ function bindChannel() {
   });
   window.addEventListener("hashchange", () => {
     const key = readKey();
+    if (!key && state.cashierSession && state.shift && state.cashierSession.token === state.shift.token && Date.now() < state.shift.end) {
+      history.replaceState(null, "", location.pathname + "#k=" + encodeURIComponent(state.shift.token));
+      ui.cashier = true;
+      ui.gate = "";
+      render();
+      return;
+    }
     if (!key) return;
     openShiftLink(key);
     render();
@@ -3865,6 +3922,20 @@ function boot() {
     ui.managerUnlocked = false;
     ui.badLink = false;
     ui.bind.pin = "";
+  } else if (state.cashierSession && state.shift && state.cashierSession.token === state.shift.token && Date.now() < state.shift.end) {
+    // A cashier session survives refresh and a removed hash. Do not fall
+    // through to Manager/Solo just because the URL fragment was cleared.
+    ui.cashier = true;
+    ui.gate = "";
+    ui.badLink = false;
+    ui.shiftEnded = false;
+    ui.settings = false;
+    ui.drawer = false;
+    ui.tab = "sell";
+    if (location.hash !== "#k=" + encodeURIComponent(state.shift.token)) {
+      history.replaceState(null, "", location.pathname + "#k=" + encodeURIComponent(state.shift.token));
+    }
+    listenForShiftEnd(state.shift.token);
   } else if (key) {
     openShiftLink(key);
   } else if (state.profile === "manager" && state.pinHash) {
