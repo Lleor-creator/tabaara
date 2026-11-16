@@ -880,6 +880,9 @@ async function loadRemoteShift(token) {
       state.manager = normalize(Object.assign(blankBook("m-", false), incoming, { inbox: [] }));
       if (!Array.isArray(state.manager.inbox)) state.manager.inbox = [];
     }
+    state.shiftLock = null;
+    ui.shiftLock = false;
+    if (ui.gate === "shift") ui.gate = "";
     ui.cashier = true;
     ui.badLink = false;
     ui.shiftEnded = false;
@@ -894,10 +897,14 @@ async function loadRemoteShift(token) {
   }
 }
 
+let shiftEndRef = null;
 function listenForShiftEnd(token) {
   if (!syncEnabled || !db || !token) return;
-  db.ref("shifts/" + token + "/meta/ended").on("value", (snap) => {
-    if (snap.val() === true && (ui.cashier || ui.shiftEnded || state.shiftLock)) {
+  if (shiftEndRef) { shiftEndRef.off(); shiftEndRef = null; }
+  shiftEndRef = db.ref("shifts/" + token + "/meta/ended");
+  shiftEndRef.on("value", (snap) => {
+    // Only react for the shift this phone is actually running.
+    if (snap.val() === true && ui.cashier && currentShiftToken() === token) {
       lockClosedShift(token, "closed");
       if (typeof render === "function") render();
     }
@@ -1678,6 +1685,7 @@ function freshUi() {
     shiftEnded: false,
     shiftLock: false,
     badLink: false,
+    shiftLoading: false,
     pending: null,
     price: {},
     helpOpen: false,
@@ -1764,6 +1772,13 @@ function readKey() {
   const match = (location.hash || "").match(/(?:^#|[&#])k=([^&]+)/);
   return match ? decodeURIComponent(match[1]) : "";
 }
+// A closed-shift lock only applies to the link it belongs to (or to a bare
+// app open with no link). A different, new link must never inherit it.
+function lockAppliesTo(key) {
+  return !!(state.shiftLock && (!key || state.shiftLock.token === key));
+}
+// Opens the till from this phone's own saved shift. Returns true only when
+// the shift is genuinely running. Unknown tokens are NOT treated as closed here.
 function enterCashier(code) {
   if (!code) return false;
   if (state.shiftLock && state.shiftLock.token === code) {
@@ -1774,19 +1789,16 @@ function enterCashier(code) {
     ui.badLink = false;
     return false;
   }
-  if (!state.shift || code !== state.shift.token || Date.now() >= state.shift.end) {
-    if (state.shift && code === state.shift.token && Date.now() >= state.shift.end) {
-      lockClosedShift(code, "expired");
-    } else {
-      ui.badLink = true;
-      ui.cashier = false;
-    }
+  if (!state.shift || code !== state.shift.token) return false;
+  if (Date.now() >= state.shift.end) {
+    lockClosedShift(code, "expired");
     return false;
   }
   ui.cashier = true;
   ui.badLink = false;
   ui.shiftEnded = false;
   ui.shiftLock = false;
+  ui.shiftLoading = false;
   ui.gate = "";
   ui.settings = false;
   ui.notice = "";
@@ -1794,6 +1806,26 @@ function enterCashier(code) {
   ui.drawer = false;
   ui.tab = "sell";
   return true;
+}
+// Single entry point for a scanned or opened shift link.
+function openShiftLink(key) {
+  if (!key) return;
+  if (enterCashier(key)) { listenForShiftEnd(key); return; }
+  if (state.shiftLock && state.shiftLock.token === key) return; // genuinely closed or expired
+  // Not known on this phone yet: check the shift online before deciding anything.
+  ui.shiftLock = false;
+  if (ui.gate === "shift") ui.gate = "";
+  ui.cashier = false;
+  ui.badLink = false;
+  ui.shiftLoading = true;
+  loadRemoteShift(key).then((ok) => {
+    ui.shiftLoading = false;
+    if (!ok && !(state.shiftLock && state.shiftLock.token === key)) {
+      ui.badLink = true;
+      ui.cashier = false;
+    }
+    render();
+  });
 }
 
 function applyTheme() {
@@ -2643,7 +2675,6 @@ function cashierShell() {
   const screen = h("main", { class: "screen" });
   if (ui.notice) screen.append(note(ui.notice, ui.noticeBad));
   screen.append(bodyFor(currentTab()));
-  screen.append(h("button", { type: "button", class: "textlink", "data-act": "leave-cashier", text: t("owner") }));
   wrap.append(screen, nav());
   if (ui.sheet) wrap.append(sheet());
   if (ui.langOpen) wrap.append(languageIntroView());
@@ -2709,6 +2740,9 @@ function endedView() {
     h("button", { type: "button", class: "btn", "data-act": "do-shift-pin", text: "Unlock owner screen" })
   );
   return gateFrame("Shift closed", "This till is locked. Sales, petty cash, and debts from the shift are already in the manager books.", kids);
+}
+function loadingView() {
+  return gateFrame("Opening till", "Checking this shift link. One moment.", h("div", { class: "stack" }));
 }
 function badLinkView() {
   return gateFrame("Link not active", "Could not open this cashier shift. Check the link or ask the owner to create a new one.", h("div", { class: "stack" },
@@ -2848,20 +2882,21 @@ function render() {
     save();
     ui.passMsg = "";
   }
-  if (state.shiftLock) {
+  if (lockAppliesTo(readKey())) {
     ui.shiftLock = true;
     ui.shiftEnded = true;
     ui.cashier = false;
+    ui.shiftLoading = false;
     ui.gate = "shift";
     ui.managerUnlocked = false;
     ui.badLink = false;
-  } else if (!ui.cashier && !ui.gate && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
+  } else if (!ui.cashier && !ui.gate && !ui.shiftLoading && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
     ui.gate = "pin";
     ui.passMsg = ui.passMsg || "";
   }
   if (ui.cashier && state.shift && Date.now() >= state.shift.end) {
     endShift();
-  } else if (ui.cashier && !state.shift && !ui.badLink) {
+  } else if (ui.cashier && !state.shift && !ui.badLink && !ui.shiftLoading) {
     lockClosedShift((readKey() || ""), "closed");
   }
   const main = document.getElementById("main");
@@ -2871,6 +2906,7 @@ function render() {
   document.documentElement.dataset.cashier = ui.cashier ? "1" : "0";
   let view;
   if (ui.shiftLock || ui.gate === "shift") view = endedView();
+  else if (ui.shiftLoading) view = loadingView();
   else if (ui.badLink) view = badLinkView();
   else if (ui.cashier) view = cashierShell();
   else if (ui.gate === "pin") view = pinGate();
@@ -3597,7 +3633,7 @@ const actions = {
     const code = (link.match(/[#&]k=([^&]+)/) || [])[1] || "";
     const decoded = decodeURIComponent(code);
     if (location.hash !== "#k=" + encodeURIComponent(decoded)) location.hash = "k=" + encodeURIComponent(decoded);
-    if (!enterCashier(decoded)) loadRemoteShift(decoded).then(ok => { if (!ok && !state.shiftLock) { ui.badLink = true; ui.cashier = false; } render(); });
+    openShiftLink(decoded);
     render();
   },
   "leave-cashier"() {
@@ -3794,10 +3830,7 @@ function bindChannel() {
   window.addEventListener("hashchange", () => {
     const key = readKey();
     if (!key) return;
-    if (!enterCashier(key)) loadRemoteShift(key).then(ok => {
-      if (!ok && !state.shiftLock) { ui.badLink = true; ui.cashier = false; }
-      render();
-    });
+    openShiftLink(key);
     render();
   });
   window.addEventListener("online", () => { if (!typing()) render(); });
@@ -3824,7 +3857,7 @@ function boot() {
   applyTheme();
   bindChannel();
   const key = readKey();
-  if (state.shiftLock && (!key || state.shiftLock.token === key)) {
+  if (lockAppliesTo(key)) {
     ui.shiftLock = true;
     ui.shiftEnded = true;
     ui.cashier = false;
@@ -3833,23 +3866,7 @@ function boot() {
     ui.badLink = false;
     ui.bind.pin = "";
   } else if (key) {
-    ui.cashier = true;
-    ui.tab = "sell";
-    ui.settings = false;
-    ui.badLink = false;
-    if (state.shift && key === state.shift.token && Date.now() < state.shift.end) {
-      // local shift already valid
-    } else if (state.shift && key === state.shift.token && Date.now() >= state.shift.end) {
-      lockClosedShift(key, "expired");
-    } else {
-      loadRemoteShift(key).then(ok => {
-        if (!ok && !state.shiftLock) {
-          ui.badLink = true;
-          ui.cashier = false;
-        }
-        render();
-      });
-    }
+    openShiftLink(key);
   } else if (state.profile === "manager" && state.pinHash) {
     ui.gate = "pin";
     ui.passMsg = "";
