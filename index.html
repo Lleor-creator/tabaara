@@ -776,25 +776,34 @@ function pushShiftEntry(entry) {
 
 function startShiftListener() {
   if (!syncEnabled || !db || !ownerUid || shiftUnsub) return;
-  // Owner listens to all shifts they created (stored under their uid)
+  // Owner listens to all shifts they created (stored under their uid).
   const ref = db.ref("owners/" + ownerUid + "/shifts");
   shiftUnsub = ref.on("child_added", (snap) => {
     const token = snap.key;
     db.ref("shifts/" + token + "/entries").on("child_added", (entrySnap) => {
       const entry = entrySnap.val();
       if (!entry || !entry.id) return;
-      // Avoid duplicates
       const exists = (state.manager.inbox || []).some(i => i.id === entry.id);
       if (exists) return;
+
       if (entry.kind === "sale" && entry.sale) {
         if (!(state.manager.sales || []).some(s => s.id === entry.sale.id)) {
           state.manager.sales.unshift(entry.sale);
         }
+      } else if (entry.kind === "expense" && entry.expense) {
+        if (!(state.manager.expenses || []).some(e => e.id === entry.expense.id)) {
+          state.manager.expenses.unshift(entry.expense);
+        }
+      } else if (entry.kind === "debt" && entry.debt) {
+        const bucket = entry.debtKind === "pay" ? state.manager.payables : state.manager.receivables;
+        if (!(bucket || []).some(d => d.id === entry.debt.id)) bucket.unshift(entry.debt);
       }
+
       logInbox({
         id: entry.id,
         at: entry.at,
         kind: entry.kind || "sale",
+        debtId: entry.kind === "debt" ? entry.debtId || entry.id : undefined,
         title: (entry.by || "Cashier") + " · " + (entry.title || "Sale"),
         detail: entry.detail || "",
         amount: entry.amount || 0
@@ -803,6 +812,42 @@ function startShiftListener() {
       if (typeof render === "function") render();
     });
   });
+}
+
+async function loadRemoteShift(token) {
+  if (!syncEnabled || !db || !token) return false;
+  try {
+    const snap = await db.ref("shifts/" + token + "/meta").once("value");
+    const meta = snap.val();
+    if (!meta || !meta.end || Date.now() >= meta.end || !meta.keyHash) return false;
+    if (meta.owner && ownerUid && meta.owner !== ownerUid) return false;
+
+    state.shift = {
+      id: meta.id || uid(),
+      keyHash: meta.keyHash,
+      token,
+      hours: meta.hours || Math.max(1, Math.round((meta.end - (meta.start || Date.now())) / 3600000)),
+      start: meta.start || Date.now(),
+      end: meta.end,
+      cashierName: meta.cashierName || "Cashier"
+    };
+
+    if (meta.book) {
+      const incoming = meta.book;
+      state.manager = normalize(Object.assign(blankBook("m-", false), incoming, { inbox: [] }));
+      if (!Array.isArray(state.manager.inbox)) state.manager.inbox = [];
+    }
+    ui.cashier = true;
+    ui.badLink = false;
+    ui.shiftEnded = false;
+    ui.settings = false;
+    ui.tab = "sell";
+    save();
+    return true;
+  } catch (err) {
+    console.warn("Could not load cashier shift", err);
+    return false;
+  }
 }
 
 function stopShiftListener() {
@@ -814,17 +859,24 @@ function stopShiftListener() {
 
 function registerShiftToken(token, hours, cashierName) {
   if (!syncEnabled || !db || !ownerUid) return;
-  const end = Date.now() + hours * 3600000;
+  const start = Date.now();
+  const end = start + hours * 3600000;
+  const shiftMeta = {
+    id: state.shift && state.shift.id,
+    owner: ownerUid,
+    cashierName: cashierName || "Cashier",
+    keyHash: state.shift && state.shift.keyHash,
+    hours,
+    start,
+    end,
+    book: JSON.parse(JSON.stringify(state.manager || blankBook("m-", false)))
+  };
   db.ref("owners/" + ownerUid + "/shifts/" + token).set({
     cashierName: cashierName || "Cashier",
     end,
-    created: Date.now()
+    created: start
   });
-  db.ref("shifts/" + token + "/meta").set({
-    owner: ownerUid,
-    cashierName: cashierName || "Cashier",
-    end
-  });
+  db.ref("shifts/" + token + "/meta").set(shiftMeta).catch(() => {});
 }
 
 const VERSION = "1.0.0-alpha";
@@ -1645,14 +1697,14 @@ function logInbox(entry) {
 }
 function shiftLink(code) {
   const token = (state.shift && state.shift.token) || code;
-  return location.origin + location.pathname + "#k=" + token;
+  return location.origin + location.pathname + "#k=" + encodeURIComponent(token);
 }
 function readKey() {
-  const match = (location.hash || "").match(/k=(\d{4,8})/);
-  return match ? match[1] : "";
+  const match = (location.hash || "").match(/(?:^#|[&#])k=([^&]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
 }
 function enterCashier(code) {
-  if (!code || !state.shift || sha256(code) !== state.shift.keyHash || Date.now() >= state.shift.end) {
+  if (!code || !state.shift || code !== state.shift.token || Date.now() >= state.shift.end) {
     ui.badLink = true;
     ui.cashier = false;
     return false;
@@ -2171,15 +2223,15 @@ function staffView() {
       h("p", { class: "code", text: ui.freshCode }),
       qrNode(link),
       h("p", { class: "link", text: link }),
-      h("p", { class: "hint", text: "Open the till on this same phone (or a second window). Another phone cannot see these books. To move a shift from a second phone, use Export / Import shift below." }),
+      h("p", { class: "hint", text: "Scan the QR or open the link on the cashier’s phone. It opens the till for this shift. Sales come back here when there is a connection." }),
       h("div", { class: "grid2" },
         h("button", { type: "button", class: "quiet", "data-act": "copy-link", "data-link": link, text: "Copy link" }),
         h("button", { type: "button", class: "btn", "data-act": "open-link", "data-link": link, text: "Open till" })
       )
     ));
   }
-  wrap.append(h("h2", { class: "section", text: "Second phone" }));
-  wrap.append(h("p", { class: "hint", text: "If the cashier uses another phone, let them work there, then export the shift file and import it here. No internet needed." }));
+  wrap.append(h("h2", { class: "section", text: "Backup copy" }));
+  wrap.append(h("p", { class: "hint", text: "Optional: download a shift file and import it later if the phones cannot connect." }));
   wrap.append(h("div", { class: "grid2" },
     h("button", { type: "button", class: "quiet", "data-act": "export-shift", text: "Export shift" }),
     h("button", { type: "button", class: "quiet", "data-act": "import-shift", text: "Import shift" })
@@ -2837,6 +2889,13 @@ function saveExpense() {
       id: uid(), at: expense.at, kind: "expense", title: t("petty"),
       detail: catLabel(expense.category) + (expense.note ? " · " + expense.note : ""), amount
     });
+    if (ui.cashier && typeof pushShiftEntry === "function") {
+      pushShiftEntry({
+        id: expense.id, kind: "expense", title: t("petty"),
+        detail: catLabel(expense.category) + (expense.note ? " · " + expense.note : ""),
+        amount, by: cashierLabel(), expense
+      });
+    }
   }
   ui.sheet = "";
   ui.bind.expId = "";
@@ -2868,6 +2927,14 @@ function saveLedgerDebt(kind) {
       detail: person + (debt.note ? " · " + debt.note : ""),
       amount
     });
+    if (ui.cashier && typeof pushShiftEntry === "function") {
+      pushShiftEntry({
+        id: debt.id, kind: "debt", debtId: debt.id, debtKind: isRec ? "rec" : "pay",
+        title: t(isRec ? "customers" : "suppliers"),
+        detail: person + (debt.note ? " · " + debt.note : ""),
+        amount, by: cashierLabel(), debt
+      });
+    }
   }
   ui.bind[personKey] = "";
   ui.bind[amountKey] = "";
@@ -3257,12 +3324,6 @@ const actions = {
   "owner-signout"() { if (typeof ownerSignOut === "function") ownerSignOut(); },
   "gen-shift"() {
     if (state.profile !== "manager" || ui.cashier) return;
-    if (!state.pinHash) {
-      toast("Set a Manager PIN in Settings before creating a shift.", true);
-      ui.settings = true;
-      render();
-      return;
-    }
     const hours = Math.min(24, Math.max(1, Number(ui.bind.hours || ui.hours) || 8));
     const cashierName = String(ui.bind.cashierName || "").trim() || "Cashier";
     if (state.shift) {
@@ -3294,9 +3355,10 @@ const actions = {
   },
   "open-link"(el) {
     const link = el.dataset.link || "";
-    const code = (link.match(/k=(\d{4,8})/) || [])[1] || "";
-    if (location.hash !== "#k=" + code) location.hash = "k=" + code;
-    enterCashier(code);
+    const code = (link.match(/[#&]k=([^&]+)/) || [])[1] || "";
+    const decoded = decodeURIComponent(code);
+    if (location.hash !== "#k=" + encodeURIComponent(decoded)) location.hash = "k=" + encodeURIComponent(decoded);
+    if (!enterCashier(decoded)) loadRemoteShift(decoded).then(ok => { if (!ok) { ui.badLink = true; ui.cashier = false; } render(); });
     render();
   },
   "leave-cashier"() {
@@ -3474,7 +3536,10 @@ function bindChannel() {
   window.addEventListener("hashchange", () => {
     const key = readKey();
     if (!key) return;
-    enterCashier(key);
+    if (!enterCashier(key)) loadRemoteShift(key).then(ok => {
+      if (!ok) { ui.badLink = true; ui.cashier = false; }
+      render();
+    });
     render();
   });
   window.addEventListener("online", () => { if (!typing()) render(); });
@@ -3501,11 +3566,22 @@ function boot() {
   applyTheme();
   bindChannel();
   const key = readKey();
-  if (key && state.shift && sha256(key) === state.shift.keyHash && Date.now() < state.shift.end) {
+  if (key) {
     ui.cashier = true;
-  } else if (key) {
-    ui.badLink = true;
-    if (state.shift && Date.now() >= state.shift.end) endShift();
+    ui.tab = "sell";
+    ui.settings = false;
+    ui.badLink = false;
+    if (state.shift && key === state.shift.token && Date.now() < state.shift.end) {
+      // local shift already valid
+    } else {
+      loadRemoteShift(key).then(ok => {
+        if (!ok) {
+          ui.badLink = true;
+          ui.cashier = false;
+        }
+        render();
+      });
+    }
   } else if (state.profile === "solo" && soloLocked()) {
     ui.gate = "solo";
   }
