@@ -815,7 +815,12 @@ function startShiftListener() {
 }
 
 async function loadRemoteShift(token) {
-  if (!syncEnabled || !db || !token) return false;
+  if (!token) return false;
+  // Wait briefly for Firebase init on a fresh phone
+  for (let i = 0; i < 10 && (!syncEnabled || !db); i++) {
+    await new Promise(r => setTimeout(r, 300));
+  }
+  if (!syncEnabled || !db) return false;
   try {
     const snap = await db.ref("shifts/" + token + "/meta").once("value");
     const meta = snap.val();
@@ -2592,7 +2597,7 @@ function endedView() {
   ));
 }
 function badLinkView() {
-  return gateFrame("Link not active", "This cashier link does not match a shift saved on this phone. Create the shift here, then open the link on this same phone.", h("div", { class: "stack" },
+  return gateFrame("Link not active", "Could not open this cashier shift. Check the link or ask the owner to create a new one.", h("div", { class: "stack" },
     h("button", { type: "button", class: "btn", "data-act": "leave-cashier", text: "Open Tabaara" })
   ));
 }
