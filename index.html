@@ -890,10 +890,19 @@ async function loadRemoteShift(token) {
 function listenForShiftEnd(token) {
   if (!syncEnabled || !db || !token) return;
   db.ref("shifts/" + token + "/meta/ended").on("value", (snap) => {
-    if (snap.val() === true && ui.cashier) {
+    if (snap.val() === true && (ui.cashier || ui.shiftEnded)) {
       ui.shiftEnded = true;
       ui.cashier = false;
       state.shift = null;
+      state.profile = "solo";
+      ui.managerUnlocked = false;
+      if (state.pinHash) {
+        ui.gate = "pin";
+        ui.passMsg = "";
+        ui.bind.pin = "";
+      } else {
+        ui.gate = "";
+      }
       save();
       if (typeof render === "function") render();
     }
@@ -2768,6 +2777,10 @@ function sheetBody() {
 
 function render() {
   applyTheme();
+  if (!ui.cashier && !ui.gate && !ui.managerUnlocked && state.profile === "manager" && state.pinHash) {
+    ui.gate = "pin";
+    ui.passMsg = ui.passMsg || "";
+  }
   if (ui.cashier && state.shift && Date.now() >= state.shift.end) {
     endShift();
     ui.shiftEnded = true;
@@ -3113,6 +3126,7 @@ const actions = {
     if (!checkPin(ui.bind.pin || "")) { render(); return; }
     ui.gate = "";
     ui.passMsg = "";
+    ui.managerUnlocked = true;
     ui.cashier = false;
     ui.shiftEnded = false;
     ui.badLink = false;
@@ -3668,6 +3682,10 @@ function boot() {
         render();
       });
     }
+  } else if (state.profile === "manager" && state.pinHash) {
+    ui.gate = "pin";
+    ui.passMsg = "";
+    ui.bind.pin = "";
   } else if (state.profile === "solo" && soloLocked()) {
     ui.gate = "solo";
   }
