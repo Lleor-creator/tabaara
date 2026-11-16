@@ -816,6 +816,10 @@ function startShiftListener() {
       if (entry.kind === "sale" && entry.sale) {
         if (!(state.manager.sales || []).some(s => s.id === entry.sale.id)) {
           state.manager.sales.unshift(entry.sale);
+          const product = (state.manager.products || []).find(p => p.id === entry.sale.productId);
+          if (product && entry.sale.qty) {
+            product.stock = roundQty(Math.max(0, product.stock - entry.sale.qty));
+          }
         }
       } else if (entry.kind === "expense" && entry.expense) {
         if (!(state.manager.expenses || []).some(e => e.id === entry.expense.id)) {
@@ -875,11 +879,25 @@ async function loadRemoteShift(token) {
     ui.settings = false;
     ui.tab = "sell";
     save();
+    listenForShiftEnd(token);
     return true;
   } catch (err) {
     console.warn("Could not load cashier shift", err);
     return false;
   }
+}
+
+function listenForShiftEnd(token) {
+  if (!syncEnabled || !db || !token) return;
+  db.ref("shifts/" + token + "/meta/ended").on("value", (snap) => {
+    if (snap.val() === true && ui.cashier) {
+      ui.shiftEnded = true;
+      ui.cashier = false;
+      state.shift = null;
+      save();
+      if (typeof render === "function") render();
+    }
+  });
 }
 
 function stopShiftListener() {
@@ -1781,7 +1799,12 @@ function cashierLabel() {
 }
 function endShift() {
   if (!state.shift) return;
+  const token = state.shift.token;
   const hours = state.shift.hours;
+  if (token && syncEnabled && db) {
+    db.ref("shifts/" + token + "/meta/ended").set(true).catch(() => {});
+    db.ref("shifts/" + token + "/meta/endedAt").set(Date.now()).catch(() => {});
+  }
   state.shift = null;
   ui.freshCode = "";
   logInbox({
@@ -1831,7 +1854,7 @@ function pinField(label, bind) {
 function header() {
   if (ui.cashier) {
     const line = h("p", { class: "subhead" });
-    line.append(document.createTextNode(t("cashier") + " · "));
+    line.append(document.createTextNode(cashierLabel() + " · "));
     line.append(h("span", { "data-clock": "1", text: state.shift ? remain(state.shift.end) : t("out") }));
     return h("header", { class: "top split" },
       h("div", {}, h("p", { class: "brand-static", text: "Tabaara" }), line),
